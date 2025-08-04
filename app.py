@@ -48,7 +48,7 @@ class AgentType(Enum):
 # Configuration
 class Config:
     # Pinecone Config
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_4fDoXn_DRnYvPMcXNS9nBQ91ZtEKyNsqh6e7S1XcDK6GdeH5tX9Qo9zyqJV9bVDejxjxKe")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
     # Updated for Gemini embeddings
     EMBEDDING_MODEL = "models/text-embedding-004"  # Gemini embedding model
@@ -60,7 +60,7 @@ class Config:
     MIN_CHUNK_LENGTH = 100
     
     # Agent Config - Updated for Gemini
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBV0PCWJFSpo9n5gQ1x5Ji3nEAlewk7sIE")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # Fast and cost-effective
     MAX_AGENT_TOKENS = 4000
     
