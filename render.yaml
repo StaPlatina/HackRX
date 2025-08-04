@@ -1,12 +1,13 @@
 services:
   - type: web
-    name: multi-agent-rag
+    name: document-qa-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
-    plan: free
+    startCommand: python main.py
     envVars:
-      - key: REDIS_HOST
-        value: <your-redis-host>
-      - key: REDIS_PORT
-        value: "6379"
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: VALID_BEARER_TOKEN
+        sync: false
