@@ -8,7 +8,6 @@ import httpx
 import asyncio
 import logging
 from sentence_transformers import SentenceTransformer
-import pinecone
 from pinecone import Pinecone, ServerlessSpec
 from groq import Groq
 import PyPDF2
