@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+boto3
+sentence-transformers
+PyPDF2
+python-docx
+aiohttp
+redis
+tiktoken
+qdrant-client
