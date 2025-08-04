@@ -17,7 +17,6 @@ from pydantic import BaseModel
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import PyPDF2
 import docx
 import aiohttp
@@ -25,7 +24,6 @@ import redis
 from functools import lru_cache
 import tiktoken
 import time
-import torch
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -50,10 +48,11 @@ class AgentType(Enum):
 # Configuration
 class Config:
     # Pinecone Config
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_4fDoXn_DRnYvPMcXNS9nBQ91ZtEKyNsqh6e7S1XcDK6GdeH5tX9Qo9zyqJV9bVDejxjxKe")
     PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
-    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-    EMBEDDING_DIMENSION = 384
+    # Updated for Gemini embeddings
+    EMBEDDING_MODEL = "models/text-embedding-004"  # Gemini embedding model
+    EMBEDDING_DIMENSION = 768  # Gemini text-embedding-004 dimension
     
     # Document Processing
     CHUNK_SIZE = 512
@@ -61,7 +60,7 @@ class Config:
     MIN_CHUNK_LENGTH = 100
     
     # Agent Config - Updated for Gemini
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBV0PCWJFSpo9n5gQ1x5Ji3nEAlewk7sIE")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # Fast and cost-effective
     MAX_AGENT_TOKENS = 4000
     
@@ -74,7 +73,6 @@ class Config:
     REDIS_PORT = int(os.getenv("REDIS_PORT", 0)) if os.getenv("REDIS_PORT") else 0  # 0 by default
     CACHE_EXPIRY = 86400
     TIMEOUT = 60
-    USE_GPU = torch.cuda.is_available()
 
 config = Config()
 
@@ -83,13 +81,6 @@ thread_pool = ThreadPoolExecutor(max_workers=4)
 agent_pool = ThreadPoolExecutor(max_workers=3)
 
 # Initialize services
-@lru_cache(maxsize=1)
-def get_embedding_model():
-    logger.info("Initializing embedding model...")
-    device = "cuda" if config.USE_GPU else "cpu"
-    model = SentenceTransformer(config.EMBEDDING_MODEL, device=device)
-    return model
-
 @lru_cache(maxsize=1)
 def get_gemini_client():
     logger.info("Initializing Gemini client...")
@@ -111,10 +102,103 @@ def get_pinecone_client():
     return pc
 
 # Initialize services
-embedding_model = get_embedding_model()
 gemini_model = get_gemini_client()
 tokenizer = get_tokenizer()
 pinecone_client = get_pinecone_client()
+
+# Gemini Embedding Service
+class GeminiEmbeddingService:
+    @staticmethod
+    async def generate_embeddings(texts: List[str]) -> List[List[float]]:
+        """Generate embeddings using Gemini API"""
+        try:
+            logger.info(f"Generating embeddings for {len(texts)} texts using Gemini API")
+            
+            # Use asyncio to run the blocking operation in thread pool
+            loop = asyncio.get_event_loop()
+            
+            embeddings = []
+            batch_size = 100  # Gemini API batch limit
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                logger.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
+                
+                # Generate embeddings for batch
+                batch_embeddings = await loop.run_in_executor(
+                    thread_pool,
+                    lambda: GeminiEmbeddingService._generate_batch_embeddings(batch)
+                )
+                embeddings.extend(batch_embeddings)
+                
+                # Small delay to respect rate limits
+                if len(texts) > batch_size:
+                    await asyncio.sleep(0.1)
+            
+            logger.info(f"Generated {len(embeddings)} embeddings successfully")
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+    
+    @staticmethod
+    def _generate_batch_embeddings(texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for a batch of texts (synchronous)"""
+        try:
+            embeddings = []
+            for text in texts:
+                # Clean and truncate text if needed
+                clean_text = text.strip()[:8000]  # Gemini has input limits
+                
+                if not clean_text:
+                    # Handle empty text with a default embedding
+                    logger.warning("Empty text found, using zero embedding")
+                    embeddings.append([0.0] * config.EMBEDDING_DIMENSION)
+                    continue
+                
+                # Generate embedding using Gemini
+                result = genai.embed_content(
+                    model=config.EMBEDDING_MODEL,
+                    content=clean_text,
+                    task_type="retrieval_document"  # Optimized for document retrieval
+                )
+                
+                embeddings.append(result['embedding'])
+                
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Batch embedding generation error: {e}")
+            # Return zero embeddings as fallback
+            return [[0.0] * config.EMBEDDING_DIMENSION for _ in texts]
+    
+    @staticmethod
+    async def generate_query_embedding(query: str) -> List[float]:
+        """Generate embedding for a single query"""
+        try:
+            logger.info(f"Generating query embedding for: {query[:50]}...")
+            
+            clean_query = query.strip()[:8000]
+            if not clean_query:
+                return [0.0] * config.EMBEDDING_DIMENSION
+            
+            loop = asyncio.get_event_loop()
+            embedding = await loop.run_in_executor(
+                thread_pool,
+                lambda: genai.embed_content(
+                    model=config.EMBEDDING_MODEL,
+                    content=clean_query,
+                    task_type="retrieval_query"  # Optimized for query
+                )['embedding']
+            )
+            
+            logger.info(f"Generated query embedding with dimension: {len(embedding)}")
+            return embedding
+            
+        except Exception as e:
+            logger.error(f"Query embedding error: {e}")
+            return [0.0] * config.EMBEDDING_DIMENSION
 
 # Redis client - Optional for caching
 redis_client = None
@@ -342,9 +426,38 @@ class VectorStorage:
             return False
     
     @staticmethod
+    def check_index_dimension(index_name: str) -> Optional[int]:
+        """Check the dimension of an existing index"""
+        try:
+            index_info = pinecone_client.describe_index(index_name)
+            return index_info.dimension
+        except:
+            return None
+    
+    @staticmethod
     def create_index(index_name: str):
         """Create Pinecone index"""
         try:
+            # Check if index exists with wrong dimension
+            if VectorStorage.index_exists(index_name):
+                existing_dimension = VectorStorage.check_index_dimension(index_name)
+                if existing_dimension and existing_dimension != config.EMBEDDING_DIMENSION:
+                    logger.warning(f"Index {index_name} exists with dimension {existing_dimension}, but we need {config.EMBEDDING_DIMENSION}")
+                    logger.info(f"Deleting existing index {index_name} to recreate with correct dimension")
+                    pinecone_client.delete_index(index_name)
+                    
+                    # Wait for deletion to complete
+                    import time
+                    max_wait = 60
+                    for _ in range(max_wait):
+                        if not VectorStorage.index_exists(index_name):
+                            break
+                        time.sleep(1)
+                    logger.info(f"Deleted index {index_name}")
+                elif existing_dimension == config.EMBEDDING_DIMENSION:
+                    logger.info(f"Index {index_name} already exists with correct dimension {config.EMBEDDING_DIMENSION}")
+                    return
+            
             # Try different region formats based on Pinecone's current offerings
             regions_to_try = [
                 "us-east-1",
@@ -359,7 +472,7 @@ class VectorStorage:
                     logger.info(f"Attempting to create index in region: {region}")
                     pinecone_client.create_index(
                         name=index_name,
-                        dimension=config.EMBEDDING_DIMENSION,
+                        dimension=config.EMBEDDING_DIMENSION,  # Updated for Gemini embeddings
                         metric="cosine",
                         spec=ServerlessSpec(
                             cloud="aws" if "us-east" in region or "us-west" in region or "eu-west" in region else "gcp",
@@ -379,7 +492,7 @@ class VectorStorage:
                             pass
                         time.sleep(1)
                     
-                    logger.info(f"Successfully created Pinecone index: {index_name} in region: {region}")
+                    logger.info(f"Successfully created Pinecone index: {index_name} in region: {region} with dimension: {config.EMBEDDING_DIMENSION}")
                     return
                     
                 except Exception as region_error:
@@ -395,15 +508,11 @@ class VectorStorage:
     
     @staticmethod
     async def store_embeddings(index_name: str, chunks: List[Dict[str, Any]], document_url: str):
-        """Store chunk embeddings in Pinecone"""
+        """Store chunk embeddings in Pinecone using Gemini embeddings"""
         chunk_texts = [chunk["text"] for chunk in chunks]
         
-        # Generate embeddings
-        loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            thread_pool,
-            lambda: embedding_model.encode(chunk_texts, show_progress_bar=False).tolist()
-        )
+        # Generate embeddings using Gemini API
+        embeddings = await GeminiEmbeddingService.generate_embeddings(chunk_texts)
         
         # Get index
         index = pinecone_client.Index(index_name)
@@ -440,12 +549,8 @@ class MultiAgentSystem:
         try:
             logger.info(f"Retrieval agent processing query: {query[:100]}...")
             
-            # Generate query embedding
-            loop = asyncio.get_event_loop()
-            query_embedding = await loop.run_in_executor(
-                thread_pool,
-                lambda: embedding_model.encode([query], show_progress_bar=False)[0].tolist()
-            )
+            # Generate query embedding using Gemini
+            query_embedding = await GeminiEmbeddingService.generate_query_embedding(query)
             
             logger.info(f"Generated embedding vector with dimension: {len(query_embedding)}")
             
@@ -742,11 +847,26 @@ async def process_query(
         index_exists = VectorStorage.index_exists(index_name)
         is_cached = CacheService.get_index_cache(index_name)
         
-        if not index_exists or not is_cached:
-            logger.info("Processing new document...")
+        # Check for dimension mismatch if index exists
+        needs_reprocessing = False
+        if index_exists:
+            existing_dimension = VectorStorage.check_index_dimension(index_name)
+            if existing_dimension and existing_dimension != config.EMBEDDING_DIMENSION:
+                logger.info(f"Index {index_name} has dimension {existing_dimension}, but we need {config.EMBEDDING_DIMENSION}. Will recreate.")
+                needs_reprocessing = True
+                # Clear cache since we're recreating
+                if redis_client:
+                    try:
+                        redis_client.delete(f"ma_index:{index_name}")
+                    except:
+                        pass
+                is_cached = False
+        
+        if not index_exists or not is_cached or needs_reprocessing:
+            logger.info("Processing new document or recreating index...")
             
-            # Create index if needed
-            if not index_exists:
+            # Create index if needed (this will handle dimension mismatches)
+            if not index_exists or needs_reprocessing:
                 VectorStorage.create_index(index_name)
             
             # Download and process document
@@ -763,7 +883,7 @@ async def process_query(
             # Create chunks
             chunks = DocumentProcessor.smart_chunk_text(full_text)
             
-            # Store in Pinecone
+            # Store in Pinecone using Gemini embeddings
             await VectorStorage.store_embeddings(index_name, chunks, document_url)
             
             # Mark as processed
@@ -811,20 +931,32 @@ async def health_check():
     except:
         pinecone_status = "disconnected"
     
+    # Test Gemini embedding service
+    gemini_embedding_status = "connected"
+    try:
+        test_embedding = await GeminiEmbeddingService.generate_query_embedding("test")
+        if not test_embedding or len(test_embedding) != config.EMBEDDING_DIMENSION:
+            gemini_embedding_status = "error"
+    except:
+        gemini_embedding_status = "disconnected"
+    
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
             "pinecone": pinecone_status,
             "redis": "connected" if redis_client else "disconnected",
-            "gemini": "available" if config.GEMINI_API_KEY else "not configured"
+            "gemini": "available" if config.GEMINI_API_KEY else "not configured",
+            "gemini_embeddings": gemini_embedding_status
         },
         "agents": [
             "retrieval_agent",
             "analysis_agent", 
             "formatting_agent",
             "orchestrator_agent"
-        ]
+        ],
+        "embedding_model": config.EMBEDDING_MODEL,
+        "embedding_dimension": config.EMBEDDING_DIMENSION
     }
 
 # Root endpoint
@@ -837,14 +969,16 @@ async def root():
         "docs": "/docs",
         "architecture": {
             "storage": "Pinecone Vector Database",
+            "embeddings": "Google Gemini text-embedding-004 API",
             "agents": {
-                "1_retrieval": "Intelligently retrieves relevant chunks from Pinecone",
-                "2_analysis": "Analyzes chunks and extracts comprehensive answers",
+                "1_retrieval": "Intelligently retrieves relevant chunks from Pinecone using Gemini embeddings",
+                "2_analysis": "Analyzes chunks and extracts comprehensive answers using Gemini",
                 "3_formatting": "Formats answers to be concise and well-structured",
                 "4_orchestrator": "Coordinates the entire multi-agent workflow"
             },
             "features": [
                 "Pinecone vector-based semantic search",
+                "Gemini API-based embeddings (no local GPU required)",
                 "Multi-agent processing pipeline",
                 "Intelligent answer formatting",
                 "Redis caching at multiple levels",
@@ -882,6 +1016,46 @@ async def check_pinecone_regions(authorized: bool = Depends(verify_token)):
             regions_info["errors"].append(f"GCP {region}: {str(e)}")
     
     return regions_info
+
+@app.post("/debug/test-embeddings")
+async def test_embeddings(
+    texts: List[str],
+    authorized: bool = Depends(verify_token)
+):
+    """Test Gemini embedding generation"""
+    try:
+        if len(texts) > 10:  # Limit for testing
+            return {"error": "Maximum 10 texts allowed for testing"}
+        
+        embeddings = await GeminiEmbeddingService.generate_embeddings(texts)
+        
+        return {
+            "input_count": len(texts),
+            "output_count": len(embeddings),
+            "embedding_dimension": len(embeddings[0]) if embeddings else 0,
+            "expected_dimension": config.EMBEDDING_DIMENSION,
+            "embeddings_preview": [emb[:5] for emb in embeddings[:3]]  # First 5 dimensions of first 3 embeddings
+        }
+    except Exception as e:
+        import traceback
+@app.get("/debug/embedding-info")
+async def embedding_info():
+    """Get embedding model information"""
+    return {
+        "embedding_model": config.EMBEDDING_MODEL,
+        "embedding_dimension": config.EMBEDDING_DIMENSION,
+        "provider": "Google Gemini API",
+        "task_types": {
+            "documents": "retrieval_document",
+            "queries": "retrieval_query"
+        },
+        "benefits": [
+            "No local GPU/CPU strain",
+            "Consistent performance",
+            "Latest embedding model",
+            "Automatic updates"
+        ]
+    }
 
 @app.post("/debug/test-retrieval")
 async def test_retrieval(
@@ -961,6 +1135,91 @@ async def test_agents(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug/check-index")
+async def check_index_info(
+    index_name: str,
+    authorized: bool = Depends(verify_token)
+):
+    """Check index information and dimension"""
+    try:
+        if not VectorStorage.index_exists(index_name):
+            return {
+                "index_name": index_name,
+                "exists": False,
+                "message": "Index does not exist"
+            }
+        
+        # Get index info
+        index_info = pinecone_client.describe_index(index_name)
+        index = pinecone_client.Index(index_name)
+        
+        try:
+            stats = index.describe_index_stats()
+        except Exception as e:
+            stats = f"Could not get stats: {e}"
+        
+        return {
+            "index_name": index_name,
+            "exists": True,
+            "dimension": index_info.dimension,
+            "expected_dimension": config.EMBEDDING_DIMENSION,
+            "dimension_match": index_info.dimension == config.EMBEDDING_DIMENSION,
+            "metric": index_info.metric,
+            "stats": stats,
+            "spec": {
+                "cloud": index_info.spec.serverless.cloud,
+                "region": index_info.spec.serverless.region
+            }
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@app.post("/debug/force-recreate-index")
+async def force_recreate_index(
+    index_name: str,
+    authorized: bool = Depends(verify_token)
+):
+    """Force recreate an index with correct dimensions"""
+    try:
+        if VectorStorage.index_exists(index_name):
+            logger.info(f"Deleting existing index {index_name}")
+            pinecone_client.delete_index(index_name)
+            
+            # Wait for deletion
+            import time
+            max_wait = 60
+            for i in range(max_wait):
+                if not VectorStorage.index_exists(index_name):
+                    break
+                time.sleep(1)
+                if i % 10 == 0:
+                    logger.info(f"Waiting for index deletion... {i}s")
+        
+        # Create new index
+        VectorStorage.create_index(index_name)
+        
+        # Clear cache
+        if redis_client:
+            try:
+                redis_client.delete(f"ma_index:{index_name}")
+            except:
+                pass
+        
+        return {
+            "message": f"Index {index_name} recreated successfully",
+            "new_dimension": config.EMBEDDING_DIMENSION
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
 
 if __name__ == "__main__":
     import uvicorn
