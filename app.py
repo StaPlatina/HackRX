@@ -10,6 +10,8 @@ import uuid
 import re
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
+import time
+import random
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.gzip import GZipMiddleware
@@ -23,7 +25,6 @@ import aiohttp
 import redis
 from functools import lru_cache
 import tiktoken
-import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,10 +60,16 @@ class Config:
     CHUNK_OVERLAP = 128
     MIN_CHUNK_LENGTH = 100
     
-    # Agent Config - Updated for Gemini
+    # Agent Config - Updated for Gemini with rate limiting
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBV0PCWJFSpo9n5gQ1x5Ji3nEAlewk7sIE")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # Fast and cost-effective
     MAX_AGENT_TOKENS = 4000
+    
+    # Rate limiting for Gemini API
+    GEMINI_REQUESTS_PER_MINUTE = 15  # Conservative limit
+    GEMINI_REQUEST_DELAY = 4.0  # 4 seconds between requests
+    EMBEDDING_BATCH_SIZE = 10  # Smaller batches for embeddings
+    EMBEDDING_REQUEST_DELAY = 2.0  # 2 seconds between embedding batches
     
     # Retrieval Config
     TOP_K_RETRIEVAL = 15
@@ -76,9 +83,59 @@ class Config:
 
 config = Config()
 
+# Rate limiting tracker
+class RateLimiter:
+    def __init__(self):
+        self.last_gemini_request = 0
+        self.last_embedding_request = 0
+        self.request_count = 0
+        self.reset_time = time.time() + 60  # Reset counter every minute
+    
+    async def wait_for_gemini_rate_limit(self):
+        """Wait if necessary to respect Gemini rate limits"""
+        current_time = time.time()
+        
+        # Reset counter every minute
+        if current_time > self.reset_time:
+            self.request_count = 0
+            self.reset_time = current_time + 60
+        
+        # Check if we've exceeded requests per minute
+        if self.request_count >= config.GEMINI_REQUESTS_PER_MINUTE:
+            wait_time = self.reset_time - current_time
+            logger.info(f"Rate limit reached, waiting {wait_time:.1f}s")
+            await asyncio.sleep(wait_time)
+            self.request_count = 0
+            self.reset_time = time.time() + 60
+        
+        # Wait for minimum delay between requests
+        time_since_last = current_time - self.last_gemini_request
+        if time_since_last < config.GEMINI_REQUEST_DELAY:
+            wait_time = config.GEMINI_REQUEST_DELAY - time_since_last
+            logger.info(f"Waiting {wait_time:.1f}s for rate limit")
+            await asyncio.sleep(wait_time)
+        
+        self.last_gemini_request = time.time()
+        self.request_count += 1
+    
+    async def wait_for_embedding_rate_limit(self):
+        """Wait if necessary for embedding requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_embedding_request
+        
+        if time_since_last < config.EMBEDDING_REQUEST_DELAY:
+            wait_time = config.EMBEDDING_REQUEST_DELAY - time_since_last
+            logger.info(f"Waiting {wait_time:.1f}s for embedding rate limit")
+            await asyncio.sleep(wait_time)
+        
+        self.last_embedding_request = time.time()
+
+# Global rate limiter
+rate_limiter = RateLimiter()
+
 # Thread pools
-thread_pool = ThreadPoolExecutor(max_workers=4)
-agent_pool = ThreadPoolExecutor(max_workers=3)
+thread_pool = ThreadPoolExecutor(max_workers=2)  # Reduced for rate limiting
+agent_pool = ThreadPoolExecutor(max_workers=1)   # Single thread for LLM calls
 
 # Initialize services
 @lru_cache(maxsize=1)
@@ -106,41 +163,65 @@ gemini_model = get_gemini_client()
 tokenizer = get_tokenizer()
 pinecone_client = get_pinecone_client()
 
-# Gemini Embedding Service
+# Gemini Embedding Service with better error handling
 class GeminiEmbeddingService:
     @staticmethod
     async def generate_embeddings(texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using Gemini API"""
+        """Generate embeddings using Gemini API with rate limiting"""
         try:
             logger.info(f"Generating embeddings for {len(texts)} texts using Gemini API")
             
-            # Use asyncio to run the blocking operation in thread pool
-            loop = asyncio.get_event_loop()
+            if not texts:
+                logger.warning("Empty texts list provided")
+                return []
             
             embeddings = []
-            batch_size = 100  # Gemini API batch limit
+            batch_size = config.EMBEDDING_BATCH_SIZE
             
             for i in range(0, len(texts), batch_size):
                 batch = texts[i:i + batch_size]
                 logger.info(f"Processing embedding batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
                 
-                # Generate embeddings for batch
-                batch_embeddings = await loop.run_in_executor(
-                    thread_pool,
-                    lambda: GeminiEmbeddingService._generate_batch_embeddings(batch)
-                )
-                embeddings.extend(batch_embeddings)
+                # Apply rate limiting
+                await rate_limiter.wait_for_embedding_rate_limit()
                 
-                # Small delay to respect rate limits
-                if len(texts) > batch_size:
-                    await asyncio.sleep(0.1)
+                # Generate embeddings for batch with retry logic
+                batch_embeddings = await GeminiEmbeddingService._generate_batch_embeddings_with_retry(batch)
+                embeddings.extend(batch_embeddings)
             
             logger.info(f"Generated {len(embeddings)} embeddings successfully")
             return embeddings
             
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
-            raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+            # Return zero embeddings as fallback
+            return [[0.0] * config.EMBEDDING_DIMENSION for _ in texts]
+    
+    @staticmethod
+    async def _generate_batch_embeddings_with_retry(texts: List[str], max_retries: int = 3) -> List[List[float]]:
+        """Generate embeddings with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                loop = asyncio.get_event_loop()
+                embeddings = await loop.run_in_executor(
+                    thread_pool,
+                    lambda: GeminiEmbeddingService._generate_batch_embeddings(texts)
+                )
+                return embeddings
+            except Exception as e:
+                error_str = str(e).lower()
+                if "quota" in error_str or "429" in error_str or "rate" in error_str:
+                    wait_time = (2 ** attempt) * 5  # Exponential backoff: 5s, 10s, 20s
+                    logger.warning(f"Rate limit hit, attempt {attempt + 1}/{max_retries}, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Non-rate-limit error in embedding generation: {e}")
+                    break
+        
+        # If all retries failed, return zero embeddings
+        logger.error("All embedding generation attempts failed, returning zero embeddings")
+        return [[0.0] * config.EMBEDDING_DIMENSION for _ in texts]
     
     @staticmethod
     def _generate_batch_embeddings(texts: List[str]) -> List[List[float]]:
@@ -166,6 +247,9 @@ class GeminiEmbeddingService:
                 
                 embeddings.append(result['embedding'])
                 
+                # Small delay between individual embeddings within batch
+                time.sleep(0.1)
+                
             return embeddings
             
         except Exception as e:
@@ -175,13 +259,16 @@ class GeminiEmbeddingService:
     
     @staticmethod
     async def generate_query_embedding(query: str) -> List[float]:
-        """Generate embedding for a single query"""
+        """Generate embedding for a single query with rate limiting"""
         try:
             logger.info(f"Generating query embedding for: {query[:50]}...")
             
             clean_query = query.strip()[:8000]
             if not clean_query:
                 return [0.0] * config.EMBEDDING_DIMENSION
+            
+            # Apply rate limiting
+            await rate_limiter.wait_for_embedding_rate_limit()
             
             loop = asyncio.get_event_loop()
             embedding = await loop.run_in_executor(
@@ -219,24 +306,10 @@ if config.REDIS_HOST and config.REDIS_PORT:
 else:
     logger.info("Redis not configured - running without cache")
 
-# Test Pinecone connection and check available regions
+# Test Pinecone connection
 try:
     indexes = pinecone_client.list_indexes()
     logger.info("Pinecone connected successfully")
-    
-    # Log available regions for debugging
-    try:
-        # This will help us see what regions are actually available
-        test_spec = ServerlessSpec(cloud="aws", region="us-east-1")
-        logger.info("Pinecone AWS regions appear to be available")
-    except Exception as region_check:
-        logger.warning(f"AWS regions might not be available: {region_check}")
-        try:
-            test_spec = ServerlessSpec(cloud="gcp", region="us-central1-gcp") 
-            logger.info("Pinecone GCP regions appear to be available")
-        except Exception as gcp_check:
-            logger.warning(f"GCP regions check: {gcp_check}")
-            
 except Exception as e:
     logger.error(f"Failed to initialize Pinecone: {e}")
     raise
@@ -257,9 +330,9 @@ async def shutdown_event():
     if session:
         await session.close()
 
-# Request/Response Models - Updated for compatibility
+# Request/Response Models
 class QueryRequest(BaseModel):
-    documents: str  # Changed from HttpUrl to str for compatibility
+    documents: str
     questions: List[str]
 
 class QueryResponse(BaseModel):
@@ -278,7 +351,6 @@ class DocumentProcessor:
     def generate_index_name(url: str) -> str:
         """Generate Pinecone index name from URL"""
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-        # Pinecone index names must be lowercase and alphanumeric with hyphens
         return f"doc-{url_hash}"
     
     @staticmethod
@@ -287,7 +359,9 @@ class DocumentProcessor:
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
-                return await response.read()
+                content = await response.read()
+                logger.info(f"Downloaded document: {len(content)} bytes")
+                return content
         except Exception as e:
             logger.error(f"Download failed: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to download: {str(e)}")
@@ -306,7 +380,9 @@ class DocumentProcessor:
                 if text.strip():
                     full_text += f"\n\n[Page {page_num}]\n{text}"
             
-            return full_text.strip()
+            extracted_text = full_text.strip()
+            logger.info(f"Extracted {len(extracted_text)} characters from PDF")
+            return extracted_text
         except Exception as e:
             logger.error(f"PDF extraction error: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to process PDF: {str(e)}")
@@ -325,7 +401,9 @@ class DocumentProcessor:
                 elif para.text.strip():
                     full_text += para.text + "\n"
             
-            return full_text.strip()
+            extracted_text = full_text.strip()
+            logger.info(f"Extracted {len(extracted_text)} characters from DOCX")
+            return extracted_text
         except Exception as e:
             logger.error(f"DOCX extraction error: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to process DOCX: {str(e)}")
@@ -414,7 +492,7 @@ class DocumentProcessor:
         
         return chunks
 
-# Vector Storage with Pinecone
+# Vector Storage with Pinecone (US-East-1 only)
 class VectorStorage:
     @staticmethod
     def index_exists(index_name: str) -> bool:
@@ -447,7 +525,6 @@ class VectorStorage:
                     pinecone_client.delete_index(index_name)
                     
                     # Wait for deletion to complete
-                    import time
                     max_wait = 60
                     for _ in range(max_wait):
                         if not VectorStorage.index_exists(index_name):
@@ -462,7 +539,7 @@ class VectorStorage:
             logger.info(f"Creating index in us-east-1 region")
             pinecone_client.create_index(
                 name=index_name,
-                dimension=config.EMBEDDING_DIMENSION,  # Updated for Gemini embeddings
+                dimension=config.EMBEDDING_DIMENSION,
                 metric="cosine",
                 spec=ServerlessSpec(
                     cloud="aws",
@@ -471,7 +548,6 @@ class VectorStorage:
             )
             
             # Wait for index to be ready
-            import time
             max_retries = 60
             for _ in range(max_retries):
                 try:
@@ -491,10 +567,19 @@ class VectorStorage:
     @staticmethod
     async def store_embeddings(index_name: str, chunks: List[Dict[str, Any]], document_url: str):
         """Store chunk embeddings in Pinecone using Gemini embeddings"""
+        if not chunks:
+            logger.warning("No chunks to store")
+            return
+        
+        logger.info(f"Storing embeddings for {len(chunks)} chunks")
         chunk_texts = [chunk["text"] for chunk in chunks]
         
         # Generate embeddings using Gemini API
         embeddings = await GeminiEmbeddingService.generate_embeddings(chunk_texts)
+        
+        if not embeddings or len(embeddings) != len(chunks):
+            logger.error(f"Embedding generation failed or mismatch: got {len(embeddings)} embeddings for {len(chunks)} chunks")
+            raise Exception("Failed to generate embeddings for all chunks")
         
         # Get index
         index = pinecone_client.Index(index_name)
@@ -502,6 +587,11 @@ class VectorStorage:
         # Prepare vectors for upsert
         vectors = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+            # Validate embedding
+            if not embedding or len(embedding) != config.EMBEDDING_DIMENSION:
+                logger.warning(f"Invalid embedding for chunk {i}, skipping")
+                continue
+                
             vector_id = f"{hashlib.sha256(chunk['text'].encode()).hexdigest()[:16]}_{i}"
             vectors.append({
                 "id": vector_id,
@@ -514,15 +604,24 @@ class VectorStorage:
                 }
             })
         
+        if not vectors:
+            logger.error("No valid vectors to store")
+            raise Exception("No valid embeddings generated")
+        
         # Upsert in batches (Pinecone has a limit of 100 vectors per batch)
         batch_size = 100
         for i in range(0, len(vectors), batch_size):
             batch = vectors[i:i + batch_size]
-            index.upsert(vectors=batch)
+            try:
+                index.upsert(vectors=batch)
+                logger.info(f"Stored batch {i//batch_size + 1}/{(len(vectors) + batch_size - 1)//batch_size}")
+            except Exception as e:
+                logger.error(f"Failed to store batch {i//batch_size + 1}: {e}")
+                raise
         
-        logger.info(f"Stored {len(vectors)} embeddings in Pinecone index: {index_name}")
+        logger.info(f"Successfully stored {len(vectors)} embeddings in Pinecone index: {index_name}")
 
-# Multi-Agent System
+# Multi-Agent System with improved error handling
 class MultiAgentSystem:
     
     @staticmethod
@@ -533,6 +632,10 @@ class MultiAgentSystem:
             
             # Generate query embedding using Gemini
             query_embedding = await GeminiEmbeddingService.generate_query_embedding(query)
+            
+            if not query_embedding or len(query_embedding) != config.EMBEDDING_DIMENSION:
+                logger.error("Failed to generate valid query embedding")
+                return []
             
             logger.info(f"Generated embedding vector with dimension: {len(query_embedding)}")
             
@@ -599,7 +702,7 @@ class MultiAgentSystem:
     
     @staticmethod
     async def analysis_agent(chunks: List[Dict[str, Any]], question: str) -> str:
-        """Agent 2: Analyze chunks and extract answer"""
+        """Agent 2: Analyze chunks and extract answer with rate limiting"""
         logger.info(f"Analysis agent received {len(chunks)} chunks for question: {question[:50]}...")
         
         if not chunks:
@@ -655,7 +758,12 @@ Answer:"""
     
     @staticmethod
     async def formatting_agent(raw_answer: str, question: str) -> str:
-        """Agent 3: Format and make answer concise"""
+        """Agent 3: Format and make answer concise with rate limiting"""
+        # Skip formatting agent if we're hitting rate limits - return raw answer
+        if "quota" in raw_answer.lower() or "rate limit" in raw_answer.lower():
+            logger.info("Skipping formatting agent due to rate limits")
+            return raw_answer
+        
         prompt = f"""You are a Formatting Agent. Your job is to take an analytical answer and make it concise and well-formatted.
 
 Original Question: {question}
@@ -703,22 +811,29 @@ Provide the formatted answer:"""
                 raw_answer = await MultiAgentSystem.analysis_agent(chunks, question)
                 logger.info(f"Analysis complete: {len(raw_answer)} chars")
                 
-                # Step 3: Formatting Agent
-                formatted_answer = await MultiAgentSystem.formatting_agent(raw_answer, question)
-                logger.info(f"Formatting complete: {len(formatted_answer)} chars")
+                # Step 3: Formatting Agent (skip if rate limited)
+                if "quota" not in raw_answer.lower() and "rate limit" not in raw_answer.lower():
+                    formatted_answer = await MultiAgentSystem.formatting_agent(raw_answer, question)
+                    logger.info(f"Formatting complete: {len(formatted_answer)} chars")
+                else:
+                    formatted_answer = raw_answer
+                    logger.info("Skipped formatting due to rate limits")
                 
                 answers.append(formatted_answer)
                 
             except Exception as e:
                 logger.error(f"Error processing question {i+1}: {e}")
-                answers.append("Unable to process this question.")
+                answers.append("Unable to process this question due to rate limits or other errors.")
         
         return answers
     
     @staticmethod
     async def _query_llm(prompt: str, agent_type: AgentType, max_tokens: int = 1500) -> str:
-        """Query Gemini LLM for specific agent"""
+        """Query Gemini LLM for specific agent with rate limiting"""
         try:
+            # Apply rate limiting
+            await rate_limiter.wait_for_gemini_rate_limit()
+            
             # Configure generation parameters
             generation_config = genai.types.GenerationConfig(
                 max_output_tokens=max_tokens,
@@ -728,26 +843,44 @@ Provide the formatted answer:"""
             
             # Use executor to run in thread pool
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                agent_pool,
-                lambda: gemini_model.generate_content(
-                    prompt,
-                    generation_config=generation_config
-                )
-            )
             
-            if response.text:
-                return response.text.strip()
-            else:
-                logger.warning("Empty response from Gemini")
-                return ""
+            # Retry logic for rate limits
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = await loop.run_in_executor(
+                        agent_pool,
+                        lambda: gemini_model.generate_content(
+                            prompt,
+                            generation_config=generation_config
+                        )
+                    )
+                    
+                    if response.text:
+                        return response.text.strip()
+                    else:
+                        logger.warning("Empty response from Gemini")
+                        return "Unable to generate response - empty response from API."
+                        
+                except Exception as e:
+                    error_str = str(e).lower()
+                    if ("quota" in error_str or "429" in error_str or "rate" in error_str) and attempt < max_retries - 1:
+                        wait_time = (2 ** attempt) * 10  # Exponential backoff: 10s, 20s, 40s
+                        logger.warning(f"Rate limit hit in {agent_type.value}, attempt {attempt + 1}/{max_retries}, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        raise e
+            
+            return "Unable to generate response due to rate limits."
             
         except Exception as e:
             logger.error(f"Gemini query error for {agent_type.value}: {e}")
-            # Handle potential quota/rate limit errors
-            if "quota" in str(e).lower() or "rate" in str(e).lower():
-                await asyncio.sleep(1)  # Brief delay for rate limits
-            raise
+            error_str = str(e).lower()
+            if "quota" in error_str or "429" in error_str or "rate" in error_str:
+                return f"Rate limit exceeded for {agent_type.value}. Please try again later."
+            else:
+                return f"Error in {agent_type.value}: Unable to process request."
     
     @staticmethod
     def _clean_response(response: str) -> str:
@@ -808,7 +941,7 @@ class CacheService:
         except:
             pass
 
-# Main API Endpoint - Updated path for compatibility
+# Main API Endpoint
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_query(
     request: QueryRequest,
@@ -818,7 +951,7 @@ async def process_query(
     start_time = time.time()
     
     try:
-        document_url = request.documents  # Now it's a string
+        document_url = request.documents
         questions = request.questions
         index_name = DocumentProcessor.generate_index_name(document_url)
         
@@ -862,8 +995,14 @@ async def process_query(
             else:
                 full_text = DocumentProcessor.extract_text_from_pdf(content)
             
+            if not full_text or len(full_text.strip()) < 100:
+                raise HTTPException(status_code=400, detail="Document appears to be empty or too short")
+            
             # Create chunks
             chunks = DocumentProcessor.smart_chunk_text(full_text)
+            
+            if not chunks:
+                raise HTTPException(status_code=400, detail="Failed to create text chunks from document")
             
             # Store in Pinecone using Gemini embeddings
             await VectorStorage.store_embeddings(index_name, chunks, document_url)
@@ -890,8 +1029,10 @@ async def process_query(
             agent_answers = await MultiAgentSystem.orchestrator_agent([question], index_name)
             answer = agent_answers[0] if agent_answers else "Unable to process question."
             
-            # Cache the answer
-            CacheService.set_answer_cache(index_name, question, answer)
+            # Cache the answer (only if it's not an error message)
+            if "rate limit" not in answer.lower() and "quota" not in answer.lower():
+                CacheService.set_answer_cache(index_name, question, answer)
+            
             answers.append(answer)
         
         processing_time = time.time() - start_time
@@ -938,7 +1079,12 @@ async def health_check():
             "orchestrator_agent"
         ],
         "embedding_model": config.EMBEDDING_MODEL,
-        "embedding_dimension": config.EMBEDDING_DIMENSION
+        "embedding_dimension": config.EMBEDDING_DIMENSION,
+        "rate_limiting": {
+            "requests_per_minute": config.GEMINI_REQUESTS_PER_MINUTE,
+            "request_delay_seconds": config.GEMINI_REQUEST_DELAY,
+            "embedding_batch_size": config.EMBEDDING_BATCH_SIZE
+        }
     }
 
 # Root endpoint
@@ -950,7 +1096,7 @@ async def root():
         "version": "4.0.0",
         "docs": "/docs",
         "architecture": {
-            "storage": "Pinecone Vector Database",
+            "storage": "Pinecone Vector Database (US-East-1 only)",
             "embeddings": "Google Gemini text-embedding-004 API",
             "agents": {
                 "1_retrieval": "Intelligently retrieves relevant chunks from Pinecone using Gemini embeddings",
@@ -959,17 +1105,18 @@ async def root():
                 "4_orchestrator": "Coordinates the entire multi-agent workflow"
             },
             "features": [
-                "Pinecone vector-based semantic search",
-                "Gemini API-based embeddings (no local GPU required)",
+                "Pinecone vector-based semantic search (US-East-1)",
+                "Gemini API-based embeddings with rate limiting",
                 "Multi-agent processing pipeline",
                 "Intelligent answer formatting",
                 "Redis caching at multiple levels",
-                "Support for PDF and DOCX"
+                "Support for PDF and DOCX",
+                "Comprehensive error handling",
+                "Rate limit protection"
             ]
         }
     }
 
-# Debug endpoints
 # Debug endpoints
 @app.get("/debug/pinecone-regions")
 async def check_pinecone_regions(authorized: bool = Depends(verify_token)):
@@ -998,8 +1145,8 @@ async def test_embeddings(
 ):
     """Test Gemini embedding generation"""
     try:
-        if len(texts) > 10:  # Limit for testing
-            return {"error": "Maximum 10 texts allowed for testing"}
+        if len(texts) > 5:  # Reduced limit for testing to avoid rate limits
+            return {"error": "Maximum 5 texts allowed for testing"}
         
         embeddings = await GeminiEmbeddingService.generate_embeddings(texts)
         
@@ -1012,23 +1159,29 @@ async def test_embeddings(
         }
     except Exception as e:
         import traceback
-@app.get("/debug/embedding-info")
-async def embedding_info():
-    """Get embedding model information"""
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+@app.get("/debug/rate-limit-status")
+async def rate_limit_status(authorized: bool = Depends(verify_token)):
+    """Check current rate limit status"""
+    current_time = time.time()
     return {
-        "embedding_model": config.EMBEDDING_MODEL,
-        "embedding_dimension": config.EMBEDDING_DIMENSION,
-        "provider": "Google Gemini API",
-        "task_types": {
-            "documents": "retrieval_document",
-            "queries": "retrieval_query"
-        },
-        "benefits": [
-            "No local GPU/CPU strain",
-            "Consistent performance",
-            "Latest embedding model",
-            "Automatic updates"
-        ]
+        "current_time": current_time,
+        "last_gemini_request": rate_limiter.last_gemini_request,
+        "last_embedding_request": rate_limiter.last_embedding_request,
+        "request_count": rate_limiter.request_count,
+        "reset_time": rate_limiter.reset_time,
+        "seconds_until_reset": max(0, rate_limiter.reset_time - current_time),
+        "requests_remaining": max(0, config.GEMINI_REQUESTS_PER_MINUTE - rate_limiter.request_count),
+        "config": {
+            "requests_per_minute": config.GEMINI_REQUESTS_PER_MINUTE,
+            "request_delay": config.GEMINI_REQUEST_DELAY,
+            "embedding_batch_size": config.EMBEDDING_BATCH_SIZE,
+            "embedding_delay": config.EMBEDDING_REQUEST_DELAY
+        }
     }
 
 @app.post("/debug/test-retrieval")
@@ -1067,126 +1220,6 @@ async def test_retrieval(
                 }
                 for chunk in chunks[:5]  # Show first 5 chunks
             ]
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-@app.post("/debug/test-agents")
-async def test_agents(
-    index_name: str,
-    question: str,
-    authorized: bool = Depends(verify_token)
-):
-    """Test individual agents"""
-    try:
-        # Test retrieval
-        chunks = await MultiAgentSystem.retrieval_agent(question, index_name)
-        
-        # Test analysis
-        raw_answer = await MultiAgentSystem.analysis_agent(chunks, question) if chunks else "No chunks found"
-        
-        # Test formatting
-        formatted = await MultiAgentSystem.formatting_agent(raw_answer, question)
-        
-        return {
-            "question": question,
-            "retrieval": {
-                "chunks_found": len(chunks),
-                "top_scores": [c['score'] for c in chunks[:3]]
-            },
-            "analysis": {
-                "raw_answer_length": len(raw_answer),
-                "raw_answer_preview": raw_answer[:200] + "..."
-            },
-            "formatting": {
-                "formatted_length": len(formatted),
-                "formatted_answer": formatted
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/debug/check-index")
-async def check_index_info(
-    index_name: str,
-    authorized: bool = Depends(verify_token)
-):
-    """Check index information and dimension"""
-    try:
-        if not VectorStorage.index_exists(index_name):
-            return {
-                "index_name": index_name,
-                "exists": False,
-                "message": "Index does not exist"
-            }
-        
-        # Get index info
-        index_info = pinecone_client.describe_index(index_name)
-        index = pinecone_client.Index(index_name)
-        
-        try:
-            stats = index.describe_index_stats()
-        except Exception as e:
-            stats = f"Could not get stats: {e}"
-        
-        return {
-            "index_name": index_name,
-            "exists": True,
-            "dimension": index_info.dimension,
-            "expected_dimension": config.EMBEDDING_DIMENSION,
-            "dimension_match": index_info.dimension == config.EMBEDDING_DIMENSION,
-            "metric": index_info.metric,
-            "stats": stats,
-            "spec": {
-                "cloud": index_info.spec.serverless.cloud,
-                "region": index_info.spec.serverless.region
-            }
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-
-@app.post("/debug/force-recreate-index")
-async def force_recreate_index(
-    index_name: str,
-    authorized: bool = Depends(verify_token)
-):
-    """Force recreate an index with correct dimensions"""
-    try:
-        if VectorStorage.index_exists(index_name):
-            logger.info(f"Deleting existing index {index_name}")
-            pinecone_client.delete_index(index_name)
-            
-            # Wait for deletion
-            import time
-            max_wait = 60
-            for i in range(max_wait):
-                if not VectorStorage.index_exists(index_name):
-                    break
-                time.sleep(1)
-                if i % 10 == 0:
-                    logger.info(f"Waiting for index deletion... {i}s")
-        
-        # Create new index
-        VectorStorage.create_index(index_name)
-        
-        # Clear cache
-        if redis_client:
-            try:
-                redis_client.delete(f"ma_index:{index_name}")
-            except:
-                pass
-        
-        return {
-            "message": f"Index {index_name} recreated successfully",
-            "new_dimension": config.EMBEDDING_DIMENSION
         }
     except Exception as e:
         import traceback
