@@ -2,7 +2,7 @@ fastapi
 uvicorn
 httpx
 sentence-transformers
-pinecone-client
+pinecone
 groq
 PyPDF2
 pydantic
