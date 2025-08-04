@@ -48,7 +48,7 @@ class AgentType(Enum):
 # Configuration
 class Config:
     # Pinecone Config
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_4fDoXn_DRnYvPMcXNS9nBQ91ZtEKyNsqh6e7S1XcDK6GdeH5tX9Qo9zyqJV9bVDejxjxKe")
     PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
     # Updated for Gemini embeddings
     EMBEDDING_MODEL = "models/text-embedding-004"  # Gemini embedding model
@@ -60,7 +60,7 @@ class Config:
     MIN_CHUNK_LENGTH = 100
     
     # Agent Config - Updated for Gemini
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBV0PCWJFSpo9n5gQ1x5Ji3nEAlewk7sIE")
     GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  # Fast and cost-effective
     MAX_AGENT_TOKENS = 4000
     
@@ -436,7 +436,7 @@ class VectorStorage:
     
     @staticmethod
     def create_index(index_name: str):
-        """Create Pinecone index"""
+        """Create Pinecone index in us-east-1 only"""
         try:
             # Check if index exists with wrong dimension
             if VectorStorage.index_exists(index_name):
@@ -458,53 +458,35 @@ class VectorStorage:
                     logger.info(f"Index {index_name} already exists with correct dimension {config.EMBEDDING_DIMENSION}")
                     return
             
-            # Try different region formats based on Pinecone's current offerings
-            regions_to_try = [
-                "us-east-1",
-                "us-west-2", 
-                "eu-west-1",
-                "us-central1-gcp",
-                "us-east1-gcp"
-            ]
+            # Create index only in us-east-1 region
+            logger.info(f"Creating index in us-east-1 region")
+            pinecone_client.create_index(
+                name=index_name,
+                dimension=config.EMBEDDING_DIMENSION,  # Updated for Gemini embeddings
+                metric="cosine",
+                spec=ServerlessSpec(
+                    cloud="aws",
+                    region="us-east-1"
+                )
+            )
             
-            for region in regions_to_try:
+            # Wait for index to be ready
+            import time
+            max_retries = 60
+            for _ in range(max_retries):
                 try:
-                    logger.info(f"Attempting to create index in region: {region}")
-                    pinecone_client.create_index(
-                        name=index_name,
-                        dimension=config.EMBEDDING_DIMENSION,  # Updated for Gemini embeddings
-                        metric="cosine",
-                        spec=ServerlessSpec(
-                            cloud="aws" if "us-east" in region or "us-west" in region or "eu-west" in region else "gcp",
-                            region=region
-                        )
-                    )
-                    
-                    # Wait for index to be ready
-                    import time
-                    max_retries = 60
-                    for _ in range(max_retries):
-                        try:
-                            status = pinecone_client.describe_index(index_name).status
-                            if status.get('ready', False):
-                                break
-                        except:
-                            pass
-                        time.sleep(1)
-                    
-                    logger.info(f"Successfully created Pinecone index: {index_name} in region: {region} with dimension: {config.EMBEDDING_DIMENSION}")
-                    return
-                    
-                except Exception as region_error:
-                    logger.warning(f"Failed to create index in region {region}: {region_error}")
-                    continue
+                    status = pinecone_client.describe_index(index_name).status
+                    if status.get('ready', False):
+                        break
+                except:
+                    pass
+                time.sleep(1)
             
-            # If all regions fail, raise the last error
-            raise Exception("Failed to create index in any available region")
+            logger.info(f"Successfully created Pinecone index: {index_name} in us-east-1 with dimension: {config.EMBEDDING_DIMENSION}")
             
         except Exception as e:
-            logger.error(f"Error creating Pinecone index: {e}")
-            raise
+            logger.error(f"Error creating Pinecone index in us-east-1: {e}")
+            raise Exception(f"Failed to create index in us-east-1: {str(e)}")
     
     @staticmethod
     async def store_embeddings(index_name: str, chunks: List[Dict[str, Any]], document_url: str):
@@ -988,32 +970,24 @@ async def root():
     }
 
 # Debug endpoints
+# Debug endpoints
 @app.get("/debug/pinecone-regions")
 async def check_pinecone_regions(authorized: bool = Depends(verify_token)):
-    """Check available Pinecone regions"""
+    """Check us-east-1 region availability"""
     regions_info = {
-        "aws_regions": [],
-        "gcp_regions": [],
-        "errors": []
+        "target_region": "us-east-1",
+        "status": "unknown",
+        "error": None
     }
     
-    # Test AWS regions
-    aws_regions = ["us-east-1", "us-west-2", "eu-west-1"]
-    for region in aws_regions:
-        try:
-            spec = ServerlessSpec(cloud="aws", region=region)
-            regions_info["aws_regions"].append(region)
-        except Exception as e:
-            regions_info["errors"].append(f"AWS {region}: {str(e)}")
-    
-    # Test GCP regions  
-    gcp_regions = ["us-central1-gcp", "us-east1-gcp", "us-west1-gcp"]
-    for region in gcp_regions:
-        try:
-            spec = ServerlessSpec(cloud="gcp", region=region)
-            regions_info["gcp_regions"].append(region)
-        except Exception as e:
-            regions_info["errors"].append(f"GCP {region}: {str(e)}")
+    # Test only us-east-1 region
+    try:
+        spec = ServerlessSpec(cloud="aws", region="us-east-1")
+        regions_info["status"] = "available"
+        regions_info["cloud"] = "aws"
+    except Exception as e:
+        regions_info["status"] = "error"
+        regions_info["error"] = str(e)
     
     return regions_info
 
